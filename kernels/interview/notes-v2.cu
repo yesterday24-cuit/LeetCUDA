@@ -250,10 +250,10 @@ __device__ float block_reduce_max(float val) {
 // ---- Block Reduce Sum All: y = sum(a[0..N-1]) ----
 // 多 block 各自做 warp→smem→warp0 reduce，然后 atomicAdd 到全局 y
 // 跨 block 求和的常见模式，适合 N 较大时使用；
-// Grid:  ((N + 127) / 128, 1, 1)
-// Block: (128, 1, 1)
+// Grid:  ((N + 255) / 256, 1, 1)
+// Block: (256, 1, 1)
 // source: LeetCUDA/kernels/reduce/block_all_reduce.cu
-template <const int NUM_THREADS = 128>
+template <const int NUM_THREADS = 256>
 __global__ void block_reduce_all(float *a, float *y, int N) {
   int tid = threadIdx.x;
   int idx = blockIdx.x * NUM_THREADS + tid;
@@ -272,16 +272,16 @@ __global__ void block_reduce_all(float *a, float *y, int N) {
   sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
   if (warp == 0)
     sum = warp_reduce_sum<NUM_WARPS>(sum);
-  if (tid == 0) // tid == 0, not lane 0.
+  if (tid == 0) // tid == 0, not lane 0. 只有 block 内的一个线程负责写回全局结果，避免重复累加
     atomicAdd(y, sum);
 }
 
 // ---- Dot Product: y = sum(a[i] * b[i]) ----
 // 核心模式：elementwise 乘法 → block reduce → atomicAdd 全局累加
-// Grid:  ((N + 127) / 128, 1, 1)
-// Block: (128, 1, 1)
+// Grid:  ((N + 255) / 256, 1, 1)
+// Block: (256, 1, 1)
 // source: LeetCUDA/kernels/dot-product/dot_product.cu
-template <const int NUM_THREADS = 128>
+template <const int NUM_THREADS = 256>
 __global__ void dot(float *a, float *b, float *y, int N) {
   int tid = threadIdx.x;
   int idx = blockIdx.x * NUM_THREADS + tid;
@@ -300,16 +300,16 @@ __global__ void dot(float *a, float *b, float *y, int N) {
   prod = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
   if (warp == 0) // 只需要 warp 0 的线程继续 reduce 即可
     prod = warp_reduce_sum<NUM_WARPS>(prod);
-  if (tid == 0)
+  if (tid == 0) // tid == 0, not lane 0. 只有 block 内的一个线程负责写回全局结果，避免重复累加
     atomicAdd(y, prod);
 }
 
 // Dot Product + float4
-// Grid:  ((N + 127) / 128, 1, 1)
-// Block: (32, 1, 1)，128/4=32
+// Grid:  ((N + 255) / 256, 1, 1), 每个block处理256元素，float4向量化后每个线程处理4元素
+// Block: (64, 1, 1)，256/4=64
 // 注意：该版本默认输入地址满足 float4 对齐；最适合 N 按 4 对齐的场景
 // source: LeetCUDA/kernels/dot-product/dot_product.cu
-template <const int NUM_THREADS = 128 / 4>
+template <const int NUM_THREADS = 256 / 4>
 __global__ void dot_vec4(float *a, float *b, float *y, int N) {
   int tid = threadIdx.x;
   int idx = (blockIdx.x * NUM_THREADS + tid) * 4;
@@ -429,39 +429,6 @@ __global__ void histogram(int *a, int *y, int N) {
 //   + variance）
 //   - Per-token 设计：一个 block 处理一个 token，无需跨 block 同步
 
-// ---- Online Softmax 辅助结构 ----
-// MD struct: 存储 running max (m) 和 running denominator (d)
-// 算法来源: "Online normalizer calculation for softmax" (arXiv:1805.02867)
-// 核心递推公式：
-//   m_new = max(m_old, x_i)
-//   d_new = d_old * exp(m_old - m_new) + exp(x_i - m_new)
-struct __align__(8) MD {
-  float m; // running max
-  float d; // running denominator (sum of exp(x - max))
-};
-
-// Warp Reduce for Online Softmax
-// 与普通 reduce 不同：归约时需同时更新 m 和 d（因为 max 在不断变大）
-template <const int kWarpSize = WARP_SIZE>
-__device__ __forceinline__ MD warp_reduce_md_op(MD value) {
-  unsigned int mask = 0xffffffff;
-#pragma unroll
-  for (int stride = kWarpSize >> 1; stride >= 1; stride >>= 1) {
-    MD other;
-    other.m = __shfl_xor_sync(mask, value.m, stride);
-    other.d = __shfl_xor_sync(mask, value.d, stride);
-
-    bool value_bigger = (value.m > other.m);
-    MD bigger_m = value_bigger ? value : other;
-    MD smaller_m = value_bigger ? other : value;
-
-    // 关键：更新 d 时需要 rescale 旧的 d 到新的 max 尺度下
-    value.d = bigger_m.d + smaller_m.d * __expf(smaller_m.m - bigger_m.m);
-    value.m = bigger_m.m;
-  }
-  return value;
-}
-
 // =============================================================================
 // Phase 3a: Softmax — 三级递进（面试核心考点）
 // =============================================================================
@@ -519,6 +486,39 @@ __global__ void safe_softmax_per_token(float *x, float *y, int N) {
 //   - 正是 FlashAttention 中 "online rescaling"：
 //     O_new = diag(exp(m_old - m_new)) * O_old + exp(m_cur - m_new) * P@V
 // 算法参考: "Online normalizer calculation for softmax" (arXiv:1805.02867)
+
+// ---- Online Softmax 辅助结构 ----
+// MD struct: 存储 running max (m) 和 running denominator (d)
+// 算法来源: "Online normalizer calculation for softmax" (arXiv:1805.02867)
+// 核心递推公式：
+//   m_new = max(m_old, x_i)
+//   d_new = d_old * exp(m_old - m_new) + exp(x_i - m_new)
+struct __align__(8) MD {
+  float m; // running max
+  float d; // running denominator (sum of exp(x - max))
+};
+
+// Warp Reduce for Online Softmax
+// 与普通 reduce 不同：归约时需同时更新 m 和 d（因为 max 在不断变大）
+template <const int kWarpSize = WARP_SIZE>
+__device__ __forceinline__ MD warp_reduce_md_op(MD value) {
+#pragma unroll
+  for (int mask = kWarpSize >> 1; mask >= 1; mask >>= 1) {
+    MD other;
+    other.m = __shfl_xor_sync(0xffffffff, value.m, mask, kWarpSize);
+    other.d = __shfl_xor_sync(0xffffffff, value.d, mask, kWarpSize);
+
+    bool value_bigger = (value.m > other.m);
+    MD bigger_m = value_bigger ? value : other;
+    MD smaller_m = value_bigger ? other : value;
+
+    // 关键：更新 d 时需要 rescale 旧的 d 到新的 max 尺度下
+    value.d = bigger_m.d + smaller_m.d * __expf(smaller_m.m - bigger_m.m);
+    value.m = bigger_m.m;
+  }
+  return value;
+}
+
 // 注意：这里默认一个 block 处理一个 token；边界线程的 d=0 只参与归约，不会写回 y
 // Grid:  (S, 1, 1)
 // Block: (H, 1, 1)，由外层 dispatch 选择 H=32/64/128/256/512/1024
@@ -2605,7 +2605,7 @@ static void test_block_reduce(int N) {
 
   dim3 block(128);
   dim3 grid((N + 127) / 128);
-  block_reduce_all<<<grid, block>>>(d_a, d_y, N);
+  block_reduce_all<128><<<grid, block>>>(d_a, d_y, N);
   check(cudaGetLastError(), "blockreduce launch");
   check(cudaDeviceSynchronize(), "blockreduce sync");
 
@@ -2646,7 +2646,7 @@ static void test_dot(int N) {
 
   dim3 block(128);
   dim3 grid((N + 127) / 128);
-  dot<<<grid, block>>>(d_a, d_b, d_y, N);
+  dot<128><<<grid, block>>>(d_a, d_b, d_y, N);
   check(cudaGetLastError(), "dot launch");
   check(cudaDeviceSynchronize(), "dot sync");
 
@@ -2660,7 +2660,7 @@ static void test_dot(int N) {
   // ---- Dot Vec4 ----
   check(cudaMemset(d_y, 0, sizeof(float)), "dot_vec4 zero Y");
   dim3 block_v4(32);
-  dot_vec4<<<grid, block_v4>>>(d_a, d_b, d_y, N);
+  dot_vec4<32><<<grid, block_v4>>>(d_a, d_b, d_y, N);
   check(cudaGetLastError(), "dot_vec4 launch");
   check(cudaDeviceSynchronize(), "dot_vec4 sync");
 
