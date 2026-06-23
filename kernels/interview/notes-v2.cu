@@ -16,7 +16,7 @@
 //   Phase 4 — RoPE：旋转位置编码（Llama 风格 theta=10000）
 //   Phase 5 — Mat Transpose：基础版 + BCF merge_write 最佳版（Bank Conflict专题）
 //   Phase 6 — GEMV：SGEMV K32/K128/K16（warp-per-row）
-//   Phase 7 — GEMM ★：SGEMM → HGEMM → MMA m16n8k16(TN布局) → WGMMA m64n128k16 
+//   Phase 7 — GEMM ★：SGEMM → HGEMM → MMA m16n8k16(TN布局) → WGMMA m64n128k16
 //   Phase 8 — FlashAttention split_q（FA-2, 含 online softmax + P@V 寄存器复用）
 //
 // =============================================================================
@@ -994,7 +994,7 @@ __global__ void sgemm(float *a, float *b, float *c, int M, int N, int K) {
     int load_gmem_a_k = bk * BK + load_smem_a_k; // A [M, K]
     int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k;
     // vec 版: FLOAT4(s_a[load_smem_a_m][load_smem_a_k]) = FLOAT4(a[load_gmem_a_addr])
-    s_a[load_smem_a_m][load_smem_a_k] = a[load_gmem_a_addr]; 
+    s_a[load_smem_a_m][load_smem_a_k] = a[load_gmem_a_addr];
     int load_gmem_b_k = bk * BK + load_smem_b_k; // B [K, N]
     int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
     // vec 版：FLOAT4(s_b[load_smem_b_k][load_smem_b_n]) = FLOAT4(b[load_gmem_b_addr]);
@@ -1228,9 +1228,9 @@ HOST_DEVICE_INLINE int div_ceil(int a, int b) {
 // =============================================================================
 // 面试重点 — Tile Hierarchy:
 //   MMA Atom:         m16n8k16（1 条 MMA 指令处理的最小 tile）
-//   MMA Tile (warp):  2×4=8 个 MMA atom = [32×32]（一个 warp 的计算）
-//   Warp Tile:        4×4=16 warps = [128×128]（整个 block 的计算）
-//   线程映射:         2×4=8 warps, 每个 warp 4×1=4 个 warp tile
+//   MMA Tile (warp):  2×4=8 个 MMA atom, 计算单元的扩展，8 个 warp，更多计算线程，[2x16,8x4]=[32,32]
+//   Warp Tile:        4×4=16 warps = [32x4,32x4]=[128,128]，每个warp（MMA）覆盖更多的value，block tile.
+//   线程映射:          2×4=8 warps, 每个 warp（MMA） 又各自重复4次（4x4）
 // 实际: MMA_TILE_M=2, MMA_TILE_N=4, WARP_TILE_M=4, WARP_TILE_N=4
 //       → BM=16×2×4=128, BN=8×4×4=128, Warps=2×4=8, Threads=8×32=256
 //
