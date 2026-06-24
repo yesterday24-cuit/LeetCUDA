@@ -1170,8 +1170,7 @@ __global__ void sgemm_vec4(float *a, float *b, float *c, int M, int N, int K) {
 // ---- ldmatrix: smem → register（Tensor Core 专用）----
 // ldmatrix.sync.aligned.xN.m8n8.shared.b16
 // 每次加载 8×8 的 half 矩阵片段到 1/2/4 条 32-bit 寄存器
-// aligned: 要求 128-bit 对齐
-// trans:  转置加载（用于 col-major 的 B 矩阵）
+// aligned: 要求 128-bit 对齐, trans:  转置加载
 #define LDMATRIX_X4(R0, R1, R2, R3, addr)                                      \
   asm volatile(                                                                \
       "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"     \
@@ -1275,12 +1274,14 @@ __global__ void __launch_bounds__(256)
   int load_smem_a_k = (tid % 2 == 0) ? 0 : 8; // 0, 8
   int load_smem_b_n = tid / 2; // 0~127 → B^T 的 N 方向（row-major 的行）
   int load_smem_b_k = (tid % 2 == 0) ? 0 : 8; // 0, 8  → B^T 的 K 方向（row-major 的列）
-  int load_gmem_a_m = by * BM + load_smem_a_m;
-  int load_gmem_b_n = bx * BN + load_smem_b_n; // B 全局列号 = N 方向的 tile 起始 + 线程偏移
+  int load_gmem_a_m = by * BM + load_smem_a_m; // C/A 全局行号 = M 方向的 tile 起始 + 线程偏移
+  int load_gmem_b_n = bx * BN + load_smem_b_n; // C/B 全局列号 = N 方向的 tile 起始 + 线程偏移
   if (load_gmem_a_m >= M || load_gmem_b_n >= N)
     return;
 
-  // 累加器：每个 thread 计算 VAL_TILE_M×VAL_TILE_N=16 累加器，一个uint32_t寄存器存储2个half
+  // 8个Warps(MMAs)的排布是M方向2个，N方向4个，则MMA Atom一次性能处理的tile大小是[2*16,4*8]=[32,32]. 
+  // CUDA中每个block能放的线程数是有上限的（warp数量有限），一般为4或者8个warps。为了能处理更大的C tile，
+  // 需要把MMA Atom的tile再M方向和N方向各自重复4次，得到[128,128]的C block tile，这就是VAL Tile的作用。
   uint32_t RC[VAL_TILE_M][VAL_TILE_N][2] = {0}; // 初始化为 0
 
   // CVTA: 一次转换 smem 基地址，避免每次 cp.async 都做转换
@@ -1294,25 +1295,24 @@ __global__ void __launch_bounds__(256)
     int load_gmem_a_k = k * BK + load_smem_a_k;
     int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k; // A: [m][k]
     int load_gmem_b_k = k * BK + load_smem_b_k;
-    int load_gmem_b_addr = load_gmem_b_n * K + load_gmem_b_k; // B^T: [n][k] row-major（即 B[k][n] col-major）⚠
+    // B^T: [n][k] row-major（即 B[k][n] col-major）⚠
+    int load_gmem_b_addr = load_gmem_b_n * K + load_gmem_b_k; 
 
-    uint32_t load_smem_a_ptr =
-        (smem_a_base_ptr +
-         (k * s_a_stage_offset + load_smem_a_m * BK + load_smem_a_k) *
-             sizeof(half));
+    uint32_t load_smem_a_ptr = (smem_a_base_ptr +
+      (k * s_a_stage_offset + load_smem_a_m * BK + load_smem_a_k) * sizeof(half)
+    );
     CP_ASYNC_CG(load_smem_a_ptr, &A[load_gmem_a_addr], 16);
 
-    uint32_t load_smem_b_ptr =
-        (smem_b_base_ptr +
-         (k * s_b_stage_offset + load_smem_b_n * BK + load_smem_b_k) *
-             sizeof(half));
+    uint32_t load_smem_b_ptr = (smem_b_base_ptr +
+      (k * s_b_stage_offset + load_smem_b_n * BK + load_smem_b_k) * sizeof(half)
+    );
     CP_ASYNC_CG(load_smem_b_ptr, &B[load_gmem_b_addr], 16);
 
     CP_ASYNC_COMMIT_GROUP();
   }
 
   const int NUM_K_TILES = div_ceil(K, BK);
-  CP_ASYNC_WAIT_GROUP(K_STAGE - 2); // 等待前 (K_STAGE-2) 个 group 完成
+  CP_ASYNC_WAIT_GROUP(K_STAGE - 2); // 允许有 K_STAGE-2 个group未完成
   __syncthreads();
 
   // 统一循环：k 从 0 开始，每次迭代负责 tile k（加载 + 计算合并为单循环）
@@ -1327,7 +1327,8 @@ __global__ void __launch_bounds__(256)
       int load_gmem_a_k = (k + K_STAGE - 1) * BK + load_smem_a_k;
       int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k; // A: row-major [m][k]
       int load_gmem_b_k = (k + K_STAGE - 1) * BK + load_smem_b_k;
-      int load_gmem_b_addr = load_gmem_b_n * K + load_gmem_b_k; // B^T: row-major [n][k]，内维连续的是 K ⚠
+      // B^T: row-major [n][k]，内维连续的是 K ⚠
+      int load_gmem_b_addr = load_gmem_b_n * K + load_gmem_b_k; 
 
       uint32_t load_smem_a_ptr =
           (smem_a_base_ptr + (smem_sel_next * s_a_stage_offset +
@@ -1354,7 +1355,7 @@ __global__ void __launch_bounds__(256)
     for (int i = 0; i < VAL_TILE_M; ++i) {
       // {0,1} * (16 * 4) + i * 16 = {0,64} + {0,16,32,48} = {0,16,32,48,64,80,96,112}
       int warp_smem_a_m = warp_m * (MMA_M * VAL_TILE_M) + i * MMA_M;
-      // {0,16,32,48,64,80,96,112} + {0~15} = {0~127}, 按照col-major的顺序访问A的4个8x8 matrix
+      // {0,16,32,...,112} + {0~15} = {0~127}, 按照col-major的顺序访问A的4个8x8 matrix (16x16)
       int lane_smem_a_m = warp_smem_a_m + lane_id % 16;
       int lane_smem_a_k = (lane_id / 16) * 8; // 0, 8
       uint32_t lane_smem_a_ptr =
@@ -1371,7 +1372,7 @@ __global__ void __launch_bounds__(256)
     for (int j = 0; j < VAL_TILE_N; ++j) {
       // {0,...,3} * (8 * 4) + j * 8 = {0,32,64,96} + {0,8,16,24} = {0,8,...,120}
       int warp_smem_b_n = warp_n * (MMA_N * VAL_TILE_N) + j * MMA_N;
-      // {0,8,...,120} + {0~7} = {0~127}, 按照row-major的顺序访问B^T的2个8x8 matrix
+      // {0,8,...,120} + {0~7} = {0~127}, 按照row-major的顺序访问B^T的2个8x8 matrix (8x16)
       int lane_smem_b_n = warp_smem_b_n + lane_id % 8;
       int lane_smem_b_k = ((lane_id / 8) % 2) * 8; // 0, 8
       uint32_t lane_smem_b_ptr =
@@ -1386,15 +1387,17 @@ __global__ void __launch_bounds__(256)
     for (int i = 0; i < VAL_TILE_M; ++i) {
 #pragma unroll
       for (int j = 0; j < VAL_TILE_N; ++j) {
-        HMMA16816(RC[i][j][0], RC[i][j][1], RA[i][0], RA[i][1], RA[i][2],
-                  RA[i][3], RB[j][0], RB[j][1], RC[i][j][0], RC[i][j][1]);
+        HMMA16816(RC[i][j][0], RC[i][j][1], // C fragment
+                  RA[i][0], RA[i][1], RA[i][2], RA[i][3], // A fragment
+                  RB[j][0], RB[j][1], // B fragment
+                  RC[i][j][0], RC[i][j][1]);
       }
     }
 
     // 自适应等待：流水线满载期用 K_STAGE-2，尾部排空用 0
     if (k + K_STAGE - 1 < NUM_K_TILES) {
       CP_ASYNC_WAIT_GROUP(K_STAGE - 2);
-    } else if (k < NUM_K_TILES - 1) {
+    } else { // 对于尾部的 k，等待所有剩余的 cp.async 完成
       CP_ASYNC_WAIT_GROUP(0);
     }
     __syncthreads();
@@ -1440,17 +1443,30 @@ __global__ void __launch_bounds__(256)
         RC1[j][3] = __shfl_sync(0xffffffff, RC[i][j][1], lane_id + 3);
       }
       // 每 4 个 lane 中只有 lane 0 做 128-bit store
+      // lane_id / 4 → 行号映射（每 4 个连续 lane 负责一行）：
+      //   ┌─────────┬───────────┬──────────────┬──────────────┐
+      //   │ lane_id │ lane_id/4 │ RC[0] 的行   │ RC[1] 的行   │
+      //   ├─────────┼───────────┼──────────────┼──────────────┤
+      //   │ 0~3     │ 0         │ row 0        │ row 8        │
+      //   │ 4~7     │ 1         │ row 1        │ row 9        │
+      //   │ 8~11    │ 2         │ row 2        │ row 10       │
+      //   │ 12~15   │ 3         │ row 3        │ row 11       │
+      //   │ 16~19   │ 4         │ row 4        │ row 12       │
+      //   │ 20~23   │ 5         │ row 5        │ row 13       │
+      //   │ 24~27   │ 6         │ row 6        │ row 14       │
+      //   │ 28~31   │ 7         │ row 7        │ row 15       │
+      //   └─────────┴───────────┴──────────────┴──────────────┘
       if (lane_id % 4 == 0) {
+        // {0,1} * (16 * 4) + i * 16 = {0,64} + {0,16,32,48} = {0,16,32,48,64,80,96,112}
         int store_warp_smem_c_m = warp_m * (MMA_M * VAL_TILE_M) + i * MMA_M;
         int store_lane_gmem_c_m = by * BM + store_warp_smem_c_m + lane_id / 4;
 #pragma unroll
         for (int j = 0; j < VAL_TILE_N; ++j) {
+          // {0,...,3} * (8 * 4) + j * 8 = {0,32,64,96} + {0,8,16,24} = {0,8,...,120}
           int store_warp_smem_c_n = warp_n * (MMA_N * VAL_TILE_N) + j * MMA_N;
           int store_lane_gmem_c_n = bx * BN + store_warp_smem_c_n;
-          int store_gmem_c_addr_0 =
-              store_lane_gmem_c_m * N + store_lane_gmem_c_n;
-          int store_gmem_c_addr_1 =
-              (store_lane_gmem_c_m + 8) * N + store_lane_gmem_c_n;
+          int store_gmem_c_addr_0 = store_lane_gmem_c_m * N + store_lane_gmem_c_n;
+          int store_gmem_c_addr_1 = (store_lane_gmem_c_m + 8) * N + store_lane_gmem_c_n;
           // 128-bit store: 一次写入 8 个 half
           *reinterpret_cast<float4 *>(&C[store_gmem_c_addr_0]) =
               *reinterpret_cast<float4 *>(&RC0[j][0]);
